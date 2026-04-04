@@ -11,13 +11,11 @@ use sqlx::PgPool;
 /// Service session info extracted by the auth middleware, available to handlers.
 #[derive(Clone, Debug)]
 pub struct ServiceSession {
-    pub id: uuid::Uuid,
     pub service_name: String,
 }
 
 #[derive(sqlx::FromRow)]
 struct SessionRow {
-    id: uuid::Uuid,
     service_name: String,
 }
 
@@ -44,7 +42,7 @@ pub async fn require_service_auth(
     let token_hash = bcrypt_hash_for_lookup(token);
 
     let row = sqlx::query_as::<_, SessionRow>(
-        "SELECT id, service_name FROM service_sessions WHERE token_hash = $1 AND alive = true"
+        "SELECT service_name FROM service_sessions WHERE token_hash = $1 AND alive = true"
     )
     .bind(&token_hash)
     .fetch_optional(&*pool)
@@ -58,7 +56,6 @@ pub async fn require_service_auth(
         Some(session) => {
             tracing::debug!(service = %session.service_name, "authenticated service request");
             request.extensions_mut().insert(ServiceSession {
-                id: session.id,
                 service_name: session.service_name,
             });
             Ok(next.run(request).await)
