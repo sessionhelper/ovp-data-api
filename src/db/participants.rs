@@ -52,6 +52,51 @@ pub async fn add(pool: &PgPool, session_id: Uuid, input: &AddParticipant) -> Res
     Ok(row)
 }
 
+/// Insert N participants into a single session in one round trip. Returns
+/// the inserted rows in the same order as the input. Used by the bot's
+/// /record flow to replace an N-call add_participant loop with a single
+/// batch INSERT, cutting the setup latency proportionally to the party
+/// size.
+pub async fn add_many(
+    pool: &PgPool,
+    session_id: Uuid,
+    inputs: &[AddParticipant],
+) -> Result<Vec<Participant>, AppError> {
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Build the VALUES clause with explicit $N placeholders. Postgres has
+    // a hard cap around 65535 bind parameters; with 3 params per row that
+    // caps us at ~21k participants per call, which is plenty given a
+    // real-world upper bound of maybe a few dozen per session.
+    let mut query = String::from(
+        "INSERT INTO session_participants (session_id, user_id, mid_session_join) VALUES ",
+    );
+    let mut first = true;
+    for i in 0..inputs.len() {
+        if !first {
+            query.push_str(", ");
+        }
+        first = false;
+        let base = i * 3;
+        query.push_str(&format!(
+            "(${}, ${}, COALESCE(${}, false))",
+            base + 1,
+            base + 2,
+            base + 3
+        ));
+    }
+    query.push_str(" RETURNING *");
+
+    let mut q = sqlx::query_as::<_, Participant>(&query);
+    for input in inputs {
+        q = q.bind(session_id).bind(input.user_id).bind(input.mid_session_join);
+    }
+
+    Ok(q.fetch_all(pool).await?)
+}
+
 pub async fn list(pool: &PgPool, session_id: Uuid) -> Result<Vec<Participant>, AppError> {
     let rows = sqlx::query_as::<_, Participant>(
         "SELECT * FROM session_participants WHERE session_id = $1"
