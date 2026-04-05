@@ -96,10 +96,17 @@ pub async fn update_consent(pool: &PgPool, id: Uuid, input: &UpdateConsent) -> R
 
     // Derive the audit action. Withdrawal wins over scope changes because
     // a withdrawal patch typically also nulls/updates consent_scope.
+    //   - grant:  first-time null → <scope>
+    //   - update: <scope_a> → <scope_b> (e.g., full → decline)
+    //   - withdraw: withdrawn_at flipped from null
     let action = if input.withdrawn_at.is_some() && existing.withdrawn_at.is_none() {
         Some("withdraw")
-    } else if input.consent_scope.is_some() && existing.consent_scope != updated.consent_scope {
-        Some("grant")
+    } else if existing.consent_scope != updated.consent_scope {
+        if existing.consent_scope.is_none() {
+            Some("grant")
+        } else {
+            Some("update")
+        }
     } else {
         None
     };
