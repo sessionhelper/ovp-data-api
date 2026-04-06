@@ -39,7 +39,7 @@ pub async fn require_service_auth(
             (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid authorization format" }))).into_response()
         })?;
 
-    let token_hash = bcrypt_hash_for_lookup(token);
+    let token_hash = hash_session_token(token);
 
     let row = sqlx::query_as::<_, SessionRow>(
         "SELECT service_name FROM service_sessions WHERE token_hash = $1 AND alive = true"
@@ -72,8 +72,4 @@ pub fn hash_session_token(token: &str) -> String {
     use sha2::{Sha256, Digest};
     let hash = Sha256::digest(token.as_bytes());
     hex::encode(hash)
-}
-
-fn bcrypt_hash_for_lookup(token: &str) -> String {
-    hash_session_token(token)
 }
