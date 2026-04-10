@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod audio_mix;
 pub mod audit;
 pub mod auth;
 pub mod beats;
@@ -40,6 +41,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(beats::routes())
         .merge(scenes::routes())
         .merge(audio::routes())
+        .merge(audio_mix::routes())
         .merge(audit::routes())
         .route_layer(middleware::from_fn_with_state(state.pool.clone(), require_service_auth))
         .with_state(state.clone());
