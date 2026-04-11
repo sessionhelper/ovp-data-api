@@ -41,7 +41,7 @@ migrations/        — 001_initial, 002_transcripts, 003_service_sessions
 | `DATABASE_URL` | yes | — |
 | `S3_ENDPOINT` | yes | — |
 | `S3_ACCESS_KEY` / `S3_SECRET_KEY` | yes | — |
-| `S3_BUCKET` | no | `ttrpg-dataset-raw` |
+| `S3_BUCKET` | no | `ovp-dataset-raw` |
 | `SHARED_SECRET` | yes | — |
 | `BIND_ADDR` | no | `127.0.0.1:8001` |
 

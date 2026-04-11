@@ -23,7 +23,7 @@ impl Config {
             s3_secret_key: env::var("S3_SECRET_KEY")
                 .expect("S3_SECRET_KEY must be set"),
             s3_bucket: env::var("S3_BUCKET")
-                .unwrap_or_else(|_| "ttrpg-dataset-raw".to_string()),
+                .unwrap_or_else(|_| "ovp-dataset-raw".to_string()),
             shared_secret: env::var("SHARED_SECRET")
                 .expect("SHARED_SECRET must be set"),
             bind_addr: env::var("BIND_ADDR")
