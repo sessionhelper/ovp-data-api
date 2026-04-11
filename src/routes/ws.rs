@@ -11,13 +11,20 @@
 //! table — the same check the HTTP auth middleware does. Connections
 //! without a valid token are rejected with 401 before the upgrade.
 //!
-//! # Subscriber types
+//! This is an internal-only API. The only trust boundary is the shared
+//! secret used to mint session tokens. Every authenticated client is
+//! treated identically — there is no per-service routing, per-role
+//! authorization, or tiered QoS at this layer. Boundary enforcement for
+//! user-facing data (per-user authorization, filtering, SSE fan-out)
+//! happens in `chronicle-portal`, not here.
 //!
-//! - **Internal** (token belongs to a service session): events are queued
-//!   via `tokio::sync::mpsc` with a 1000-message buffer so slow consumers
-//!   don't lose events.
-//! - **External** (any other valid token): events are delivered via the
-//!   broadcast channel — dropped if the consumer can't keep up.
+//! # Delivery
+//!
+//! Every connection gets the same reliable mpsc-drained delivery path:
+//! a background task drains the broadcast event bus into a private
+//! 1000-message mpsc queue that feeds the WS sender. If the client is
+//! slow to drain, the drain task backpressures against the mpsc queue
+//! rather than losing events.
 //!
 //! # Subscription protocol
 //!
@@ -46,15 +53,6 @@ use uuid::Uuid;
 
 use crate::auth::middleware::hash_session_token;
 use crate::routes::AppState;
-
-/// Whether the connected client is an internal service or an external browser.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SubscriberType {
-    /// Service session — gets reliable mpsc delivery.
-    Internal,
-    /// Browser / other — gets broadcast (drop on lag).
-    External,
-}
 
 /// Client-to-server control message.
 #[derive(Debug, Deserialize)]
@@ -91,15 +89,11 @@ fn parse_topic(raw: &str) -> Option<Topic> {
     None
 }
 
-/// Known internal service names. Tokens belonging to these services get
-/// reliable mpsc-based delivery instead of broadcast.
-const INTERNAL_SERVICES: &[&str] = &["chronicle-worker", "chronicle-bot", "chronicle-feeder"];
-
-/// Validate the bearer token and determine subscriber type.
+/// Validate the bearer token against the `service_sessions` table.
 ///
-/// Returns `None` if the token is invalid or expired, otherwise the
-/// subscriber type based on the service_name in the session row.
-async fn validate_ws_token(pool: &sqlx::PgPool, token: &str) -> Option<SubscriberType> {
+/// Returns the service_name for the session (for logging only) if the
+/// token is valid and alive, or `None` if it's invalid or expired.
+async fn validate_ws_token(pool: &sqlx::PgPool, token: &str) -> Option<String> {
     let token_hash = hash_session_token(token);
 
     #[derive(sqlx::FromRow)]
@@ -116,19 +110,8 @@ async fn validate_ws_token(pool: &sqlx::PgPool, token: &str) -> Option<Subscribe
     .ok()
     .flatten()?;
 
-    let sub_type = if INTERNAL_SERVICES.contains(&row.service_name.as_str()) {
-        SubscriberType::Internal
-    } else {
-        SubscriberType::External
-    };
-
-    tracing::debug!(
-        service = %row.service_name,
-        subscriber_type = ?sub_type,
-        "ws token validated"
-    );
-
-    Some(sub_type)
+    tracing::debug!(service = %row.service_name, "ws token validated");
+    Some(row.service_name)
 }
 
 async fn ws_upgrade(
@@ -136,8 +119,7 @@ async fn ws_upgrade(
     Query(params): Query<WsParams>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    // Validate the token before upgrading the connection.
-    let Some(subscriber_type) = validate_ws_token(&state.pool, &params.token).await else {
+    let Some(service_name) = validate_ws_token(&state.pool, &params.token).await else {
         return (
             axum::http::StatusCode::UNAUTHORIZED,
             "invalid or expired session token",
@@ -145,11 +127,15 @@ async fn ws_upgrade(
             .into_response();
     };
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, subscriber_type))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, service_name))
         .into_response()
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, subscriber_type: SubscriberType) {
+/// One code path for every authenticated WS client: a drain task copies
+/// events from the broadcast bus into a private mpsc queue, the main
+/// loop reads from the mpsc queue and forwards matching events to the
+/// client. Every authenticated client is equally trusted.
+async fn handle_socket(socket: WebSocket, state: AppState, service_name: String) {
     let (mut sender, mut receiver) = socket.split();
     let mut subscriptions: HashSet<Topic> = HashSet::new();
 
@@ -157,102 +143,57 @@ async fn handle_socket(socket: WebSocket, state: AppState, subscriber_type: Subs
     // the connection will be dropped by the underlying transport.
     let mut ping_interval = interval(Duration::from_secs(30));
 
-    match subscriber_type {
-        SubscriberType::Internal => {
-            // Internal services get reliable mpsc delivery with a 1000-message buffer.
-            // A background task drains the broadcast bus into the mpsc channel.
-            let (mpsc_tx, mut mpsc_rx) = mpsc::channel(1000);
-            let mut event_rx = state.events.subscribe();
+    // Private 1000-message mpsc queue fed by a drain task that reads
+    // from the shared broadcast bus. If this client is slow, the drain
+    // task backpressures at mpsc_tx.send().await — it does not drop.
+    let (mpsc_tx, mut mpsc_rx) = mpsc::channel(1000);
+    let mut event_rx = state.events.subscribe();
 
-            let drain_handle = tokio::spawn(async move {
-                loop {
-                    match event_rx.recv().await {
-                        Ok(event) => {
-                            if mpsc_tx.send(event).await.is_err() {
-                                // Receiver dropped — socket closed
-                                break;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(skipped = n, "internal ws drain lagged");
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+    let drain_handle = tokio::spawn(async move {
+        loop {
+            match event_rx.recv().await {
+                Ok(event) => {
+                    if mpsc_tx.send(event).await.is_err() {
+                        // Receiver dropped — socket closed
+                        break;
                     }
                 }
-            });
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(skipped = n, "ws drain lagged behind event bus");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 
-            loop {
-                tokio::select! {
-                    msg = receiver.next() => {
-                        if !handle_client_msg(msg, &mut subscriptions) {
-                            break;
-                        }
-                    }
+    loop {
+        tokio::select! {
+            msg = receiver.next() => {
+                if !handle_client_msg(msg, &mut subscriptions) {
+                    break;
+                }
+            }
 
-                    Some(api_event) = mpsc_rx.recv() => {
-                        if topic_matches(&subscriptions, &api_event) {
-                            if let Ok(json) = serde_json::to_string(&api_event) {
-                                if sender.send(Message::text(json)).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    _ = ping_interval.tick() => {
-                        if sender.send(Message::Ping(vec![].into())).await.is_err() {
+            Some(api_event) = mpsc_rx.recv() => {
+                if topic_matches(&subscriptions, &api_event) {
+                    if let Ok(json) = serde_json::to_string(&api_event) {
+                        if sender.send(Message::text(json)).await.is_err() {
                             break;
                         }
                     }
                 }
             }
 
-            drain_handle.abort();
-        }
-
-        SubscriberType::External => {
-            // External subscribers use broadcast directly — drop on lag is acceptable.
-            let mut event_rx = state.events.subscribe();
-
-            loop {
-                tokio::select! {
-                    msg = receiver.next() => {
-                        if !handle_client_msg(msg, &mut subscriptions) {
-                            break;
-                        }
-                    }
-
-                    event = event_rx.recv() => {
-                        match event {
-                            Ok(api_event) => {
-                                if topic_matches(&subscriptions, &api_event) {
-                                    if let Ok(json) = serde_json::to_string(&api_event) {
-                                        if sender.send(Message::text(json)).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                tracing::warn!(skipped = n, "external ws client lagged behind event bus");
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                break;
-                            }
-                        }
-                    }
-
-                    _ = ping_interval.tick() => {
-                        if sender.send(Message::Ping(vec![].into())).await.is_err() {
-                            break;
-                        }
-                    }
+            _ = ping_interval.tick() => {
+                if sender.send(Message::Ping(vec![].into())).await.is_err() {
+                    break;
                 }
             }
         }
     }
 
-    tracing::debug!(?subscriber_type, "ws client disconnected");
+    drain_handle.abort();
+    tracing::debug!(service = %service_name, "ws client disconnected");
 }
 
 /// Process a client WebSocket message. Returns `false` if the connection should close.
