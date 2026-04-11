@@ -47,24 +47,24 @@ Postgres or S3 directly.
 
 ## Auth model
 
-Service auth only. No user auth happens here — that lives in
-`chronicle-portal`'s Next.js BFF, which authenticates users via Discord
-OAuth and calls this service with the shared secret. See
-`sessionhelper-hub/CLAUDE.md` § shared-secret auth for the full pattern.
+**One level of trust. Shared secret in, session token out. That's it.**
 
-The `INTERNAL_SERVICES` allowlist in `src/routes/ws.rs` determines which
-services get reliable mpsc WS delivery vs. broadcast:
+chronicle-data-api is internal-only — it binds to loopback
+(`127.0.0.1:8001`) on the VPS and is not reachable from outside the
+machine. The only trust boundary is the `SHARED_SECRET` env var. A
+client that proves it has the shared secret via `POST /internal/auth`
+gets back a session token; subsequent requests send that token as a
+`Bearer` header. Every authenticated client is treated identically —
+there is no per-service allowlist, no role-based authorization, no
+tiered delivery QoS at this layer.
 
-```rust
-const INTERNAL_SERVICES: &[&str] = &[
-    "chronicle-worker",
-    "chronicle-bot",
-    "chronicle-feeder",
-];
-```
+**The internal/external boundary is enforced in `chronicle-portal`, not
+here.** The portal authenticates users via Discord OAuth, decides what
+each user is allowed to see, and fan-outs filtered events to browsers
+via SSE. chronicle-data-api does not know what a user is.
 
-External service identifiers (e.g. `chronicle-portal`) authenticate successfully
-but are treated as broadcast subscribers.
+See `sessionhelper-hub/CLAUDE.md` § shared-secret auth for the wire
+protocol details.
 
 ## Quick start
 
