@@ -1,5 +1,11 @@
+//! Bearer-token auth middleware for every `/internal/*` route except
+//! `/internal/auth` and `/internal/admin/grant` (which uses the shared-secret
+//! bootstrap path).
+
+use std::time::Duration;
+
 use axum::{
-    extract::Request,
+    extract::{Request, State},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -8,68 +14,73 @@ use axum::{
 use serde_json::json;
 use sqlx::PgPool;
 
-/// Service session info extracted by the auth middleware, available to handlers.
+use crate::auth::token::hash_token;
+use crate::db::service_sessions;
+
+/// State injected into handlers by this middleware.
 #[derive(Clone, Debug)]
 pub struct ServiceSession {
     pub service_name: String,
 }
 
-#[derive(sqlx::FromRow)]
-struct SessionRow {
-    service_name: String,
+/// Middleware state bundle.
+#[derive(Clone)]
+pub struct AuthState {
+    pub pool: PgPool,
+    pub heartbeat_reap: Duration,
 }
 
-/// Auth middleware: validates Bearer token against service_sessions table.
 pub async fn require_service_auth(
-    pool: axum::extract::State<PgPool>,
+    State(auth_state): State<AuthState>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, Response> {
-    let auth_header = request
+    let token = match extract_bearer(&request) {
+        Ok(t) => t,
+        Err(resp) => return Err(resp),
+    };
+
+    let hash = hash_token(token);
+    let name = service_sessions::lookup_alive(&auth_state.pool, &hash, auth_state.heartbeat_reap)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "auth lookup failed"})),
+            )
+                .into_response()
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "invalid or expired session token"})),
+            )
+                .into_response()
+        })?;
+
+    request.extensions_mut().insert(ServiceSession {
+        service_name: name,
+    });
+    Ok(next.run(request).await)
+}
+
+fn extract_bearer(request: &Request) -> Result<&str, Response> {
+    let header = request
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| {
-            (StatusCode::UNAUTHORIZED, Json(json!({ "error": "missing authorization header" }))).into_response()
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "missing authorization header"})),
+            )
+                .into_response()
         })?;
-
-    let token = auth_header
-        .strip_prefix("Bearer ")
-        .ok_or_else(|| {
-            (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid authorization format" }))).into_response()
-        })?;
-
-    let token_hash = hash_session_token(token);
-
-    let row = sqlx::query_as::<_, SessionRow>(
-        "SELECT service_name FROM service_sessions WHERE token_hash = $1 AND alive = true"
-    )
-    .bind(&token_hash)
-    .fetch_optional(&*pool)
-    .await
-    .map_err(|e| {
-        tracing::error!(error = %e, "auth lookup failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "internal error" }))).into_response()
-    })?;
-
-    match row {
-        Some(session) => {
-            tracing::debug!(service = %session.service_name, "authenticated service request");
-            request.extensions_mut().insert(ServiceSession {
-                service_name: session.service_name,
-            });
-            Ok(next.run(request).await)
-        }
-        None => {
-            Err((StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid or expired session token" }))).into_response())
-        }
-    }
-}
-
-/// Deterministic hash for session token storage and lookup.
-/// SHA-256 hex digest — same output every time for the same input.
-pub fn hash_session_token(token: &str) -> String {
-    use sha2::{Sha256, Digest};
-    let hash = Sha256::digest(token.as_bytes());
-    hex::encode(hash)
+    header.strip_prefix("Bearer ").ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "invalid authorization format"})),
+        )
+            .into_response()
+    })
 }

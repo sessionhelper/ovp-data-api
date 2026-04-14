@@ -1,49 +1,98 @@
+//! Users + display-name endpoints.
+
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
+use serde_json::json;
 
-use crate::db::users as db;
+use crate::auth::middleware::ServiceSession;
+use crate::db::{audit_log, display_names, users};
 use crate::error::AppError;
+use crate::ids::PseudoId;
 use crate::routes::AppState;
 
-async fn create_user(
+async fn upsert_user(
     State(state): State<AppState>,
-    Json(input): Json<db::CreateUser>,
-) -> Result<Json<db::User>, AppError> {
-    let user = db::upsert(&state.pool, &input).await?;
+    Extension(svc): Extension<ServiceSession>,
+    Json(input): Json<users::UpsertUser>,
+) -> Result<Json<users::User>, AppError> {
+    let pid_str = input.pseudo_id.as_str().to_string();
+    let user = users::upsert(&state.pool, &input).await?;
+    audit_log::append(
+        &state.pool,
+        &audit_log::Entry {
+            actor_service: &svc.service_name,
+            actor_pseudo: Some(&pid_str),
+            session_id: None,
+            resource_type: "user",
+            resource_id: pid_str.clone(),
+            action: "upserted",
+            detail: None,
+        },
+    )
+    .await?;
     Ok(Json(user))
 }
 
-async fn get_user(
+async fn fetch_user(
     State(state): State<AppState>,
-    Path(pseudo_id): Path<String>,
-) -> Result<Json<db::User>, AppError> {
-    let user = db::get_by_pseudo_id(&state.pool, &pseudo_id).await?;
-    Ok(Json(user))
+    Path(pid): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let pid = PseudoId::new(pid)?;
+    let user = users::get(&state.pool, &pid).await?;
+    let aliases = display_names::list(&state.pool, &pid).await?;
+    let latest = aliases.first().cloned();
+    Ok(Json(json!({
+        "user": user,
+        "latest_display_name": latest.map(|d| d.display_name),
+    })))
 }
 
-async fn update_user(
+async fn post_display(
     State(state): State<AppState>,
-    Path(pseudo_id): Path<String>,
-    Json(input): Json<db::UpdateUser>,
-) -> Result<Json<db::User>, AppError> {
-    let user = db::update(&state.pool, &pseudo_id, &input).await?;
-    Ok(Json(user))
+    Path(pid): Path<String>,
+    Extension(svc): Extension<ServiceSession>,
+    Json(input): Json<display_names::UpsertDisplayName>,
+) -> Result<Json<display_names::DisplayName>, AppError> {
+    let pid = PseudoId::new(pid)?;
+    // ensure user exists (FK)
+    users::upsert(&state.pool, &users::UpsertUser { pseudo_id: pid.clone() }).await?;
+    let row = display_names::upsert(&state.pool, &pid, &input).await?;
+    audit_log::append(
+        &state.pool,
+        &audit_log::Entry {
+            actor_service: &svc.service_name,
+            actor_pseudo: Some(pid.as_str()),
+            session_id: None,
+            resource_type: "display_name",
+            resource_id: format!("{}/{}", pid, row.display_name),
+            action: "seen",
+            detail: Some(json!({
+                "source": row.source,
+                "seen_count": row.seen_count,
+            })),
+        },
+    )
+    .await?;
+    Ok(Json(row))
 }
 
-async fn delete_user(
+async fn list_display(
     State(state): State<AppState>,
-    Path(pseudo_id): Path<String>,
-) -> Result<StatusCode, AppError> {
-    db::delete(&state.pool, &pseudo_id).await?;
-    Ok(StatusCode::NO_CONTENT)
+    Path(pid): Path<String>,
+) -> Result<Json<Vec<display_names::DisplayName>>, AppError> {
+    let pid = PseudoId::new(pid)?;
+    Ok(Json(display_names::list(&state.pool, &pid).await?))
 }
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/internal/users", post(create_user))
-        .route("/internal/users/{pseudo_id}", get(get_user).patch(update_user).delete(delete_user))
+        .route("/internal/users", post(upsert_user))
+        .route("/internal/users/{pseudo_id}", get(fetch_user))
+        .route(
+            "/internal/users/{pseudo_id}/display_names",
+            post(post_display).get(list_display),
+        )
 }

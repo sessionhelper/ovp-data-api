@@ -1,76 +1,60 @@
+//! Session participants — pure pseudo_id world.
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::ids::PseudoId;
 
-#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Participant {
     pub id: Uuid,
     pub session_id: Uuid,
-    pub user_id: Option<Uuid>,
-    pub display_name: Option<String>,
-    pub character_name: Option<String>,
+    pub pseudo_id: PseudoId,
     pub consent_scope: Option<String>,
     pub consented_at: Option<DateTime<Utc>>,
-    pub withdrawn_at: Option<DateTime<Utc>>,
     pub mid_session_join: bool,
     pub no_llm_training: bool,
     pub no_public_release: bool,
+    pub data_wiped_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AddParticipant {
-    pub user_id: Option<Uuid>,
-    pub mid_session_join: Option<bool>,
-    pub display_name: Option<String>,
-    pub character_name: Option<String>,
+    pub pseudo_id: PseudoId,
+    #[serde(default)]
+    pub mid_session_join: bool,
 }
 
-/// Update display metadata (names) for a participant. Used by the UI
-/// or bot to attach human-readable names after session creation.
-#[derive(Debug, Deserialize)]
-pub struct UpdateMetadata {
-    pub display_name: Option<String>,
-    pub character_name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UpdateConsent {
-    pub consent_scope: Option<String>,
-    pub consented_at: Option<DateTime<Utc>>,
-    pub withdrawn_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UpdateLicense {
-    pub no_llm_training: Option<bool>,
-    pub no_public_release: Option<bool>,
-}
-
-pub async fn add(pool: &PgPool, session_id: Uuid, input: &AddParticipant) -> Result<Participant, AppError> {
+pub async fn add(
+    pool: &PgPool,
+    session_id: Uuid,
+    input: &AddParticipant,
+) -> Result<Participant, AppError> {
+    // Upsert user first so the FK holds. This is a single statement via CTE.
     let row = sqlx::query_as::<_, Participant>(
-        "INSERT INTO session_participants (session_id, user_id, mid_session_join, display_name, character_name)
-         VALUES ($1, $2, COALESCE($3, false), $4, $5)
-         RETURNING *"
+        "WITH u AS (
+            INSERT INTO users (pseudo_id) VALUES ($2)
+            ON CONFLICT (pseudo_id) DO UPDATE SET pseudo_id = EXCLUDED.pseudo_id
+            RETURNING pseudo_id
+         )
+         INSERT INTO session_participants (session_id, pseudo_id, mid_session_join)
+         VALUES ($1, (SELECT pseudo_id FROM u), $3)
+         ON CONFLICT (session_id, pseudo_id) DO UPDATE SET
+            mid_session_join = EXCLUDED.mid_session_join
+         RETURNING *",
     )
     .bind(session_id)
-    .bind(input.user_id)
+    .bind(input.pseudo_id.as_str())
     .bind(input.mid_session_join)
-    .bind(&input.display_name)
-    .bind(&input.character_name)
     .fetch_one(pool)
     .await?;
-
     Ok(row)
 }
 
-/// Insert N participants into a single session in one round trip. Returns
-/// the inserted rows in the same order as the input. Used by the bot's
-/// /record flow to replace an N-call add_participant loop with a single
-/// batch INSERT, cutting the setup latency proportionally to the party
-/// size.
 pub async fn add_many(
     pool: &PgPool,
     session_id: Uuid,
@@ -80,179 +64,107 @@ pub async fn add_many(
         return Ok(Vec::new());
     }
 
-    // Build the VALUES clause with explicit $N placeholders. Postgres has
-    // a hard cap around 65535 bind parameters; with 5 params per row that
-    // caps us at ~13k participants per call, which is plenty given a
-    // real-world upper bound of maybe a few dozen per session.
-    let mut query = String::from(
-        "INSERT INTO session_participants (session_id, user_id, mid_session_join, display_name, character_name) VALUES ",
-    );
-    let mut first = true;
-    for i in 0..inputs.len() {
-        if !first {
-            query.push_str(", ");
-        }
-        first = false;
-        let base = i * 5;
-        query.push_str(&format!(
-            "(${}, ${}, COALESCE(${}, false), ${}, ${})",
-            base + 1,
-            base + 2,
-            base + 3,
-            base + 4,
-            base + 5
-        ));
-    }
-    query.push_str(" RETURNING *");
+    let mut tx = pool.begin().await?;
 
-    let mut q = sqlx::query_as::<_, Participant>(&query);
-    for input in inputs {
-        q = q
-            .bind(session_id)
-            .bind(input.user_id)
-            .bind(input.mid_session_join)
-            .bind(&input.display_name)
-            .bind(&input.character_name);
-    }
+    // Seed users in one pass so FKs hold.
+    let pseudos: Vec<String> = inputs.iter().map(|p| p.pseudo_id.as_str().to_string()).collect();
+    sqlx::query(
+        "INSERT INTO users (pseudo_id)
+         SELECT unnest($1::text[])
+         ON CONFLICT (pseudo_id) DO NOTHING",
+    )
+    .bind(&pseudos)
+    .execute(&mut *tx)
+    .await?;
 
-    Ok(q.fetch_all(pool).await?)
+    let mids: Vec<bool> = inputs.iter().map(|p| p.mid_session_join).collect();
+
+    let rows = sqlx::query_as::<_, Participant>(
+        "INSERT INTO session_participants (session_id, pseudo_id, mid_session_join)
+         SELECT $1, p, m
+         FROM unnest($2::text[], $3::bool[]) AS t(p, m)
+         ON CONFLICT (session_id, pseudo_id) DO UPDATE SET
+            mid_session_join = EXCLUDED.mid_session_join
+         RETURNING *",
+    )
+    .bind(session_id)
+    .bind(&pseudos)
+    .bind(&mids)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(rows)
 }
 
-/// A participant row enriched with the joined user's `pseudo_id`. This is
-/// the shape returned by the list endpoint because every downstream caller
-/// (the worker, most notably) needs the pseudo_id to address per-speaker
-/// audio chunks in S3 — and the Data API is the only place that can cheaply
-/// perform the join. Older callers that deserialize into a struct without
-/// `user_pseudo_id` keep working since serde ignores unknown fields.
-#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
-pub struct ParticipantWithUser {
-    pub id: Uuid,
-    pub session_id: Uuid,
-    pub user_id: Option<Uuid>,
-    pub user_pseudo_id: Option<String>,
-    pub display_name: Option<String>,
-    pub character_name: Option<String>,
-    pub consent_scope: Option<String>,
-    pub consented_at: Option<DateTime<Utc>>,
-    pub withdrawn_at: Option<DateTime<Utc>>,
-    pub mid_session_join: bool,
-    pub no_llm_training: bool,
-    pub no_public_release: bool,
-}
-
-pub async fn list(pool: &PgPool, session_id: Uuid) -> Result<Vec<ParticipantWithUser>, AppError> {
-    // LEFT JOIN so participants without a linked user row still appear —
-    // the worker filters those out by the None pseudo_id, but we don't
-    // want to silently drop rows from the listing.
-    let rows = sqlx::query_as::<_, ParticipantWithUser>(
-        "SELECT sp.id, sp.session_id, sp.user_id,
-                u.pseudo_id AS user_pseudo_id,
-                sp.display_name, sp.character_name,
-                sp.consent_scope, sp.consented_at, sp.withdrawn_at,
-                sp.mid_session_join, sp.no_llm_training, sp.no_public_release
-         FROM session_participants sp
-         LEFT JOIN users u ON u.id = sp.user_id
-         WHERE sp.session_id = $1"
+pub async fn list(pool: &PgPool, session_id: Uuid) -> Result<Vec<Participant>, AppError> {
+    let rows = sqlx::query_as::<_, Participant>(
+        "SELECT * FROM session_participants WHERE session_id = $1
+         ORDER BY created_at ASC",
     )
     .bind(session_id)
     .fetch_all(pool)
     .await?;
-
     Ok(rows)
 }
 
-/// Update a participant's display metadata (display_name, character_name).
-pub async fn update_metadata(pool: &PgPool, id: Uuid, input: &UpdateMetadata) -> Result<Participant, AppError> {
-    let row = sqlx::query_as::<_, Participant>(
-        "UPDATE session_participants SET
-            display_name = COALESCE($2, display_name),
-            character_name = COALESCE($3, character_name)
-         WHERE id = $1
-         RETURNING *"
-    )
-    .bind(id)
-    .bind(&input.display_name)
-    .bind(&input.character_name)
-    .fetch_optional(pool)
-    .await?
-    .ok_or_else(|| AppError::NotFound(format!("participant {id} not found")))?;
-
-    Ok(row)
+pub async fn get(pool: &PgPool, id: Uuid) -> Result<Participant, AppError> {
+    sqlx::query_as::<_, Participant>("SELECT * FROM session_participants WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("participant {id} not found")))
 }
 
-/// Update a participant's consent state and append a matching row to
-/// `consent_audit_log` in the same transaction. This is the canonical
-/// place every consent decision is audited — callers never need to write
-/// to the audit log explicitly.
-pub async fn update_consent(pool: &PgPool, id: Uuid, input: &UpdateConsent) -> Result<Participant, AppError> {
-    let mut tx = pool.begin().await?;
+#[derive(Debug, Deserialize)]
+pub struct UpdateConsent {
+    pub consent_scope: String,
+    pub consented_at: Option<DateTime<Utc>>,
+}
 
-    // Read the existing row so the audit entry can capture previous_scope.
-    let existing = sqlx::query_as::<_, Participant>(
-        "SELECT * FROM session_participants WHERE id = $1"
-    )
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| AppError::NotFound(format!("participant {id} not found")))?;
-
-    let updated = sqlx::query_as::<_, Participant>(
-        "UPDATE session_participants SET
-            consent_scope = COALESCE($2, consent_scope),
-            consented_at = COALESCE($3, consented_at),
-            withdrawn_at = COALESCE($4, withdrawn_at)
+pub async fn update_consent(
+    pool: &PgPool,
+    id: Uuid,
+    input: &UpdateConsent,
+) -> Result<Participant, AppError> {
+    if !matches!(input.consent_scope.as_str(), "full" | "decline" | "timed_out") {
+        return Err(AppError::BadRequest(format!(
+            "invalid consent_scope: {}",
+            input.consent_scope
+        )));
+    }
+    let row = sqlx::query_as::<_, Participant>(
+        "UPDATE session_participants
+         SET consent_scope = $2, consented_at = COALESCE($3, NOW())
          WHERE id = $1
-         RETURNING *"
+         RETURNING *",
     )
     .bind(id)
     .bind(&input.consent_scope)
     .bind(input.consented_at)
-    .bind(input.withdrawn_at)
-    .fetch_one(&mut *tx)
-    .await?;
-
-    // Derive the audit action. Withdrawal wins over scope changes because
-    // a withdrawal patch typically also nulls/updates consent_scope.
-    //   - grant:  first-time null → <scope>
-    //   - update: <scope_a> → <scope_b> (e.g., full → decline)
-    //   - withdraw: withdrawn_at flipped from null
-    let action = if input.withdrawn_at.is_some() && existing.withdrawn_at.is_none() {
-        Some("withdraw")
-    } else if existing.consent_scope != updated.consent_scope {
-        if existing.consent_scope.is_none() {
-            Some("grant")
-        } else {
-            Some("update")
-        }
-    } else {
-        None
-    };
-
-    if let Some(action) = action {
-        sqlx::query(
-            "INSERT INTO consent_audit_log (user_id, session_id, action, previous_scope, new_scope)
-             VALUES ($1, $2, $3, $4, $5)"
-        )
-        .bind(updated.user_id)
-        .bind(updated.session_id)
-        .bind(action)
-        .bind(&existing.consent_scope)
-        .bind(&updated.consent_scope)
-        .execute(&mut *tx)
-        .await?;
-    }
-
-    tx.commit().await?;
-    Ok(updated)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("participant {id} not found")))?;
+    Ok(row)
 }
 
-pub async fn update_license(pool: &PgPool, id: Uuid, input: &UpdateLicense) -> Result<Participant, AppError> {
+#[derive(Debug, Deserialize)]
+pub struct UpdateLicense {
+    pub no_llm_training: Option<bool>,
+    pub no_public_release: Option<bool>,
+}
+
+pub async fn update_license(
+    pool: &PgPool,
+    id: Uuid,
+    input: &UpdateLicense,
+) -> Result<Participant, AppError> {
     let row = sqlx::query_as::<_, Participant>(
         "UPDATE session_participants SET
-            no_llm_training = COALESCE($2, no_llm_training),
-            no_public_release = COALESCE($3, no_public_release)
+            no_llm_training    = COALESCE($2, no_llm_training),
+            no_public_release  = COALESCE($3, no_public_release)
          WHERE id = $1
-         RETURNING *"
+         RETURNING *",
     )
     .bind(id)
     .bind(input.no_llm_training)
@@ -260,6 +172,24 @@ pub async fn update_license(pool: &PgPool, id: Uuid, input: &UpdateLicense) -> R
     .fetch_optional(pool)
     .await?
     .ok_or_else(|| AppError::NotFound(format!("participant {id} not found")))?;
-
     Ok(row)
+}
+
+/// Mark a participant as wiped. Intended for hard-delete cascades; called
+/// after the chunk + segment cleanup has succeeded.
+pub async fn mark_wiped(
+    pool: &PgPool,
+    session_id: Uuid,
+    pseudo_id: &PseudoId,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE session_participants
+         SET data_wiped_at = NOW()
+         WHERE session_id = $1 AND pseudo_id = $2",
+    )
+    .bind(session_id)
+    .bind(pseudo_id.as_str())
+    .execute(pool)
+    .await?;
+    Ok(())
 }
