@@ -1,59 +1,80 @@
-pub mod audio;
-pub mod audio_mix;
+pub mod admin;
 pub mod audit;
 pub mod auth;
-pub mod beats;
+pub mod chunks;
+pub mod health;
+pub mod metadata;
+pub mod metrics;
+pub mod mute;
 pub mod participants;
-pub mod scenes;
-pub mod segments;
 pub mod sessions;
+pub mod uniform_crud;
 pub mod users;
 pub mod ws;
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use axum::{middleware, Router};
 use sqlx::PgPool;
+use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::trace::TraceLayer;
 
-use crate::auth::middleware::require_service_auth;
+use crate::auth::middleware::{require_service_auth, AuthState};
 use crate::events::EventSender;
+use crate::metrics::Metrics;
+use crate::storage::ObjectStore;
 
-/// Shared application state passed to all route handlers.
+/// Shared application state passed to every route handler.
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
-    pub s3_client: aws_sdk_s3::Client,
-    pub s3_bucket: String,
+    pub store: Arc<dyn ObjectStore>,
     pub shared_secret: String,
     pub events: EventSender,
+    pub resume_ttl: Duration,
+    pub ws_queue_depth: usize,
+    pub heartbeat_reap: Duration,
+    pub metrics: Metrics,
 }
 
 pub fn build_router(state: AppState) -> Router {
-    // Auth routes do NOT require service auth (they issue tokens)
-    let auth_routes = Router::new()
+    // Unauthenticated set: /internal/auth, /internal/admin/grant (shared-secret
+    // authenticated in-handler), /health/*, /metrics.
+    let public = Router::new()
         .merge(auth::routes())
+        .merge(admin::routes())
+        .merge(health::routes())
+        .merge(metrics::routes())
         .with_state(state.clone());
 
-    // All other routes require service auth
-    let protected_routes = Router::new()
+    let auth_state = AuthState {
+        pool: state.pool.clone(),
+        heartbeat_reap: state.heartbeat_reap,
+    };
+    let protected = Router::new()
         .merge(sessions::routes())
         .merge(users::routes())
         .merge(participants::routes())
-        .merge(segments::routes())
-        .merge(beats::routes())
-        .merge(scenes::routes())
-        .merge(audio::routes())
-        .merge(audio_mix::routes())
+        .merge(chunks::routes())
+        .merge(metadata::routes())
+        .merge(uniform_crud::routes())
+        .merge(mute::routes())
         .merge(audit::routes())
-        .route_layer(middleware::from_fn_with_state(state.pool.clone(), require_service_auth))
+        .route_layer(middleware::from_fn_with_state(
+            auth_state,
+            require_service_auth,
+        ))
         .with_state(state.clone());
 
-    // WebSocket endpoint sits outside the HTTP auth middleware — it validates
-    // the token from the `?token=` query parameter during the upgrade handshake.
     let ws_routes = Router::new()
         .merge(ws::routes())
         .with_state(state.clone());
 
     Router::new()
-        .merge(auth_routes)
-        .merge(protected_routes)
+        .merge(public)
+        .merge(protected)
         .merge(ws_routes)
+        .layer(CatchPanicLayer::new())
+        .layer(TraceLayer::new_for_http())
 }
